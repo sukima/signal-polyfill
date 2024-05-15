@@ -1,128 +1,196 @@
 type Revision = number;
+type Taggable = State | Computed | Watcher;
 
 interface Signal<T> {
   get(): T;
 }
 
-const $CONTEXT = Symbol('context');
 const $WATCHED = Symbol('watched');
 const $UNWATCHED = Symbol('unwatched');
 const $REVISION = Symbol('revision');
 const $WATCHER_NOTIFY = Symbol('watcher notify');
 
-let currentRevision: Revision = 0;
-let currentComputation: null | Set<Tag> = null;
+const TAGGED = new WeakMap<Tag, Taggable>();
+const WATCHERS = new Set<Watcher>();
 
-class Tag<infer TContext> {
-  [$CONTEXT]: TContext;
-  [$REVISION] = CURRENT_REVISION;
-  constructor(context: TContext) {
-    this[$CONTEXT] = context;
-  };
+let consumeTags: boolean = true;
+let currentRevision: Revision = 0;
+let currentComputation: Set<Tag> | null = null;
+let currentComputed: Computed | null = null;
+
+class Tag {
+  [$REVISION]: Revision = CURRENT_REVISION;
+  constructor(context: Taggable) {
+    TAGGED.add(this, context);
+  }
 }
 
-function dirtyTag(tag: Tag) {
+function dirtyTag(tag: Tag): void {
   if (currentComputation?.has(tag))
     throw new Error('cannot dirty tag that has been used during a computation');
   tag[$REVISION] = ++currentRevision;
   notifyWatchers();
 }
 
-function consumeTag(tag: Tag) {
-  currentComputation?.add(tag);
+function consumeTag(tag: Tag): void {
+  if (consumeTag) currentComputation?.add(tag);
 }
 
-function notifyWatchers() {
+function notifyWatchers(): void {
   for (let watcher of WATCHERS) watcher[$WATCHER_NOTIFY]();
 }
 
+function getMax(tags: Tag[]): Revision {
+  return Math.max(...tags.map((t) => t[$REVISION]));
+}
+
 export namespace Signal {
-  // A read-write Signal
   class State<T> implements Signal<T> {
     private tag = new Tag(this);
     private equals = (a: T, b: T): boolean => a === b;
     private [$WATCHED] = (): void => {};
     private [$UNWATCHED] = (): void => {};
 
-    // Create a state Signal starting with the value t
     constructor(private value: T, options: SignalOptions<T> = {}) {
       this.equals = options.equals ?? this.equals;
       this[$WATCHED] = options[$WATCHED] ?? this[$WATCHED];
       this[$UNWATCHED] = options[$UNWATCHED] ?? this[$UNWATCHED];
     }
 
-    // Get the value of the signal
-    get(): T;
+    get(): T {
+      consumeTag(this.tag);
+      return this.value;
+    }
 
-    // Set the state Signal value to t
     set(value: T): void {
       if (this.equals(this.value, value)) return;
-
+      this.value = value;
+      dirtyTag(this.tag);
     }
   }
 
-  // A Signal which is a formula based on other Signals
   class Computed<T = unknown> implements Signal<T> {
-    // Create a Signal which evaluates to the value returned by the callback.
-    // Callback is called with this signal as the this value.
-    constructor(cb: (this: Computed<T>) => T, options?: SignalOptions<T>);
+    private lastTags: Tag[] | undefined;
+    private lastRevision: Revision | undefined;
+    private lastValue: T | undefined;
+    private tag = new Tag(this);
+    private equals = (a: T, b: T): boolean => a === b;
+    private [$WATCHED] = (): void => {};
+    private [$UNWATCHED] = (): void => {};
 
-    // Get the value of the signal
-    get(): T;
+    constructor(private cb: (this: Computed<T>) => T, options: SignalOptions<T> = {}) {
+      this.equals = options.equals ?? this.equals;
+      this[$WATCHED] = options[$WATCHED] ?? this[$WATCHED];
+      this[$UNWATCHED] = options[$UNWATCHED] ?? this[$UNWATCHED];
+    }
+
+    get(): T {
+      currentComputed = this;
+
+      if (this.lastTags && getMax(this.lastTags) === this.lastRevision) {
+        if (currentComputation && this.lastTags.length > 0)
+          for (let tag of this.lastTags) currentComputation.add(tag);
+        currentComputed = null;
+        return this.lastValue;
+      }
+
+      let previousComputation = currentComputation;
+      currentComputation = new Set<Tag>();
+
+      try {
+        this.lastValue = this.cb.call(this);
+      } finally {
+        let tags = Array.from(currentComputation);
+        this.lastTags = tags;
+        this.lastRevision = getMax(tags);
+
+        if (previousComputation && tags.length > 0)
+          for (let tag of tags) previousComputation.add(tag);
+
+        currentComputation = previousComputation;
+        currentComputed = null;
+      }
+
+      return this.lastValue;
+    }
   }
 
   // This namespace includes "advanced" features that are better to
   // leave for framework authors rather than application developers.
   // Analogous to `crypto.subtle`
   namespace subtle {
-    // Run a callback with all tracking disabled
-    function untrack<T>(cb: () => T): T;
+    function untrack<T>(cb: () => T): T {
+      try {
+        consumeTags = false;
+        return cb();
+      } finally {
+        consumeTags = true;
+      }
+    }
 
     // Get the current computed signal which is tracking any signal reads, if any
-    function currentComputed(): Computed | null;
+    function currentComputed(): Computed | null {
+      return currentComputed;
+    }
 
     // Returns ordered list of all signals which this one referenced
     // during the last time it was evaluated.
     // For a Watcher, lists the set of signals which it is watching.
-    function introspectSources(s: Computed | Watcher): (State | Computed)[];
+    // function introspectSources(s: Computed | Watcher): (State | Computed)[];
 
     // Returns the Watchers that this signal is contained in, plus any
     // Computed signals which read this signal last time they were evaluated,
     // if that computed signal is (recursively) watched.
-    function introspectSinks(s: State | Computed): (Computed | Watcher)[];
+    // function introspectSinks(s: State | Computed): (Computed | Watcher)[];
 
     // True if this signal is "live", in that it is watched by a Watcher,
     // or it is read by a Computed signal which is (recursively) live.
-    function hasSinks(s: State | Computed): boolean;
+    // function hasSinks(s: State | Computed): boolean;
 
     // True if this element is "reactive", in that it depends
     // on some other signal. A Computed where hasSources is false
     // will always return the same constant.
-    function hasSources(s: Computed | Watcher): boolean;
+    // function hasSources(s: Computed | Watcher): boolean;
 
     class Watcher {
+      private signals = new Set<Signal>();
+
       // When a (recursive) source of Watcher is written to, call this callback,
       // if it hasn't already been called since the last `watch` call.
       // No signals may be read or written during the notify.
-      constructor(notify: (this: Watcher) => void);
+      constructor(readonly notify: (this: Watcher) => void) {}
 
       // Add these signals to the Watcher's set, and set the watcher to run its
       // notify callback next time any signal in the set (or one of its dependencies) changes.
       // Can be called with no arguments just to reset the "notified" state, so that
       // the notify callback will be invoked again.
-      watch(...s: Signal[]): void;
+      watch(...signals: Signal[]): void {
+        for (let signal of signals) {
+          this.signals.add(signal);
+          signal[$WATCHED].call(signal);
+        }
+        if (this.signals.size > 0) WATCHERS.add(this);
+      }
 
       // Remove these signals from the watched set (e.g., for an effect which is disposed)
-      unwatch(...s: Signal[]): void;
+      unwatch(...signals: Signal[]): void {
+        for (let signal of signals) {
+          this.signals.delete(signal);
+          signal[$UNWATCHED].call(signal);
+        }
+        if (this.signals.size === 0) WATCHERS.delete(this);
+      }
 
       // Returns the set of sources in the Watcher's set which are still dirty, or is a computed signal
       // with a source which is dirty or pending and hasn't yet been re-evaluated
-      getPending(): Signal[];
+      getPending(): Signal[] {
+        return Array.from(this.signals);
+      }
     }
 
     // Hooks to observe being watched or no longer watched
-    var watched: Symbol;
-    var unwatched: Symbol;
+    const watched = $WATCHED;
+    const unwatched = $UNWATCHED;
   }
 
   interface SignalOptions<T> {
