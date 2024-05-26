@@ -1,207 +1,256 @@
 type Revision = number;
-type Taggable = State | Computed | Watcher;
 
 interface Signal<T> {
   get(): T;
 }
 
-const $WATCHED = Symbol('watched');
-const $UNWATCHED = Symbol('unwatched');
-const $REVISION = Symbol('revision');
-const $WATCHER_NOTIFY = Symbol('watcher notify');
-
-const TAGGED = new WeakMap<Tag, Taggable>();
-const WATCHERS = new Set<Watcher>();
-
-let consumeTags: boolean = true;
-let currentRevision: Revision = 0;
-let currentComputation: Set<Tag> | null = null;
-let currentComputed: Computed | null = null;
-
-class Tag {
-  [$REVISION]: Revision = CURRENT_REVISION;
-  constructor(context: Taggable) {
-    TAGGED.add(this, context);
-  }
+interface SignalOptions<T> {
+  // The signal is passed in as the this value for context.
+  equals?: (this: Signal<T>, t: T, t2: T) => boolean;
+  // Callback called when isWatched becomes true, if it was previously false
+  [$WATCHED]?: (this: Signal<T>) => void;
+  // Callback called whenever isWatched becomes false, if it was previously true
+  [$UNWATCHED]?: (this: Signal<T>) => void;
 }
 
-function dirtyTag(tag: Tag): void {
-  if (currentComputation?.has(tag))
-    throw new Error('cannot dirty tag that has been used during a computation');
-  tag[$REVISION] = ++currentRevision;
+interface Trackable {
+  [$COMPUTED_REFS]: Set<Computed<unknown>>;
+  [$LAST_REVISION]: Revision;
+  [$LATEST_REVISION]: Revision;
+}
+
+interface Watchable extends Trackable {
+  [$WATCHED](): void;
+  [$UNWATCHED](): void;
+}
+
+const $WATCHED = Symbol('watched');
+const $UNWATCHED = Symbol('unwatched');
+const $WATCHER_NOTIFY = Symbol('watcher notify');
+const $LAST_REVISION = Symbol('last revision');
+const $LATEST_REVISION = Symbol('latest revision');
+const $COMPUTED_REFS = Symbol('computed references');
+
+let consumptionEnabled: boolean = true;
+let currentRevision: Revision = 0;
+let currentComputation: Set<Trackable> | null = null;
+let currentComputedRef: Computed<unknown> | null = null;
+let watchers = new Set<Watcher>();
+let computeds = new Set<Computed<unknown>>();
+
+function consumeTracked(tracked: Trackable): void {
+  if (consumptionEnabled) tracked[$LAST_REVISION] = tracked[$LATEST_REVISION];
+  if (currentComputation) currentComputation.add(tracked);
+}
+
+function dirtyTracked(tracked: Trackable): void {
+  tracked[$LATEST_REVISION] = ++currentRevision;
   notifyWatchers();
 }
 
-function consumeTag(tag: Tag): void {
-  if (consumeTag) currentComputation?.add(tag);
+function isTrackedDirty(tracked: Trackable): boolean {
+  return tracked[$LATEST_REVISION] > tracked[$LAST_REVISION];
+}
+
+function getMaxRevision(trackables: Trackable[]): Revision {
+  return Math.max(0, ...trackables.map((tracked) => tracked[$LATEST_REVISION]));
 }
 
 function notifyWatchers(): void {
-  for (let watcher of WATCHERS) watcher[$WATCHER_NOTIFY]();
+  for (let watcher of watchers) watcher[$WATCHER_NOTIFY].call(watcher);
 }
 
-function getMax(tags: Tag[]): Revision {
-  return Math.max(...tags.map((t) => t[$REVISION]));
-}
+class State<T> implements Signal<T>, Trackable, Watchable {
+  [$COMPUTED_REFS] = new Set<Computed<unknown>>();
+  [$LATEST_REVISION] = ++currentRevision;
+  [$LAST_REVISION] = 0;
+  [$WATCHED]() {}
+  [$UNWATCHED]() {}
 
-export namespace Signal {
-  class State<T> implements Signal<T> {
-    private tag = new Tag(this);
-    private equals = (a: T, b: T): boolean => a === b;
-    private [$WATCHED] = (): void => {};
-    private [$UNWATCHED] = (): void => {};
-
-    constructor(private value: T, options: SignalOptions<T> = {}) {
-      this.equals = options.equals ?? this.equals;
-      this[$WATCHED] = options[$WATCHED] ?? this[$WATCHED];
-      this[$UNWATCHED] = options[$UNWATCHED] ?? this[$UNWATCHED];
-    }
-
-    get(): T {
-      consumeTag(this.tag);
-      return this.value;
-    }
-
-    set(value: T): void {
-      if (this.equals(this.value, value)) return;
-      this.value = value;
-      dirtyTag(this.tag);
-    }
+  constructor(private value: T, options: SignalOptions<T> = {}) {
+    if (options.equals) this.equals = options.equals;
+    if (options[$WATCHED]) this[$WATCHED] = options[$WATCHED];
+    if (options[$UNWATCHED]) this[$UNWATCHED] = options[$UNWATCHED];
   }
 
-  class Computed<T = unknown> implements Signal<T> {
-    private lastTags: Tag[] | undefined;
-    private lastRevision: Revision | undefined;
-    private lastValue: T | undefined;
-    private tag = new Tag(this);
-    private equals = (a: T, b: T): boolean => a === b;
-    private [$WATCHED] = (): void => {};
-    private [$UNWATCHED] = (): void => {};
+  set(value: T): void {
+    if (this.equals(this.value, value)) return;
+    this.value = value;
+    dirtyTracked(this);
+  }
 
-    constructor(private cb: (this: Computed<T>) => T, options: SignalOptions<T> = {}) {
-      this.equals = options.equals ?? this.equals;
-      this[$WATCHED] = options[$WATCHED] ?? this[$WATCHED];
-      this[$UNWATCHED] = options[$UNWATCHED] ?? this[$UNWATCHED];
-    }
+  get(): T {
+    consumeTracked(this);
+    return this.value;
+  }
 
-    get(): T {
-      currentComputed = this;
+  private equals(t: T, t2: T): boolean {
+    return t === t2;
+  }
+}
 
-      if (this.lastTags && getMax(this.lastTags) === this.lastRevision) {
-        if (currentComputation && this.lastTags.length > 0)
-          for (let tag of this.lastTags) currentComputation.add(tag);
-        currentComputed = null;
-        return this.lastValue;
-      }
+class Computed<T> implements Signal<T>, Trackable, Watchable {
+  private declare lastValue: T;
+  lastTracked: Trackable[] = [];
+  [$COMPUTED_REFS] = new Set<Computed<unknown>>();
+  [$LATEST_REVISION] = ++currentRevision;
+  [$LAST_REVISION] = 0;
+  [$WATCHED]() {}
+  [$UNWATCHED]() {}
 
-      let previousComputation = currentComputation;
-      currentComputation = new Set<Tag>();
+  constructor(private getValue: () => T, options: SignalOptions<T> = {}) {
+    if (options[$WATCHED]) this[$WATCHED] = options[$WATCHED];
+    if (options[$UNWATCHED]) this[$UNWATCHED] = options[$UNWATCHED];
+  }
 
-      try {
-        this.lastValue = this.cb.call(this);
-      } finally {
-        let tags = Array.from(currentComputation);
-        this.lastTags = tags;
-        this.lastRevision = getMax(tags);
+  getPending(): Trackable[] {
+    return this.lastTracked.filter(isTrackedDirty);
+  }
 
-        if (previousComputation && tags.length > 0)
-          for (let tag of tags) previousComputation.add(tag);
-
-        currentComputation = previousComputation;
-        currentComputed = null;
-      }
-
+  get(): T {
+    if (
+      this.lastTracked.length > 0
+      && this[$LATEST_REVISION] >= getMaxRevision(this.lastTracked)
+    ) {
+      if (currentComputation && this.lastTracked.length > 0)
+        for (let tracked of this.lastTracked) currentComputation.add(tracked);
+      consumeTracked(this);
       return this.lastValue;
     }
-  }
 
-  // This namespace includes "advanced" features that are better to
-  // leave for framework authors rather than application developers.
-  // Analogous to `crypto.subtle`
-  namespace subtle {
-    function untrack<T>(cb: () => T): T {
-      try {
-        consumeTags = false;
-        return cb();
-      } finally {
-        consumeTags = true;
-      }
+    let previousComputation = currentComputation;
+    currentComputation = new Set<Trackable>();
+    currentComputedRef = this;
+
+    for (let tracked of this.lastTracked) tracked[$COMPUTED_REFS].delete(this);
+
+    try {
+      this.lastValue = this.getValue.call(this);
+    } finally {
+      this.lastTracked = Array.from(currentComputation ?? []);
+      dirtyTracked(this);
+      consumeTracked(this);
+
+      if (previousComputation)
+        for (let tracked of currentComputation)
+          previousComputation.add(tracked);
+
+      for (let tracked of this.lastTracked) tracked[$COMPUTED_REFS].add(this);
+
+      currentComputation = previousComputation;
+      currentComputedRef = null;
     }
 
-    // Get the current computed signal which is tracking any signal reads, if any
-    function currentComputed(): Computed | null {
-      return currentComputed;
-    }
-
-    // Returns ordered list of all signals which this one referenced
-    // during the last time it was evaluated.
-    // For a Watcher, lists the set of signals which it is watching.
-    // function introspectSources(s: Computed | Watcher): (State | Computed)[];
-
-    // Returns the Watchers that this signal is contained in, plus any
-    // Computed signals which read this signal last time they were evaluated,
-    // if that computed signal is (recursively) watched.
-    // function introspectSinks(s: State | Computed): (Computed | Watcher)[];
-
-    // True if this signal is "live", in that it is watched by a Watcher,
-    // or it is read by a Computed signal which is (recursively) live.
-    // function hasSinks(s: State | Computed): boolean;
-
-    // True if this element is "reactive", in that it depends
-    // on some other signal. A Computed where hasSources is false
-    // will always return the same constant.
-    // function hasSources(s: Computed | Watcher): boolean;
-
-    class Watcher {
-      private signals = new Set<Signal>();
-
-      // When a (recursive) source of Watcher is written to, call this callback,
-      // if it hasn't already been called since the last `watch` call.
-      // No signals may be read or written during the notify.
-      constructor(readonly notify: (this: Watcher) => void) {}
-
-      // Add these signals to the Watcher's set, and set the watcher to run its
-      // notify callback next time any signal in the set (or one of its dependencies) changes.
-      // Can be called with no arguments just to reset the "notified" state, so that
-      // the notify callback will be invoked again.
-      watch(...signals: Signal[]): void {
-        for (let signal of signals) {
-          this.signals.add(signal);
-          signal[$WATCHED].call(signal);
-        }
-        if (this.signals.size > 0) WATCHERS.add(this);
-      }
-
-      // Remove these signals from the watched set (e.g., for an effect which is disposed)
-      unwatch(...signals: Signal[]): void {
-        for (let signal of signals) {
-          this.signals.delete(signal);
-          signal[$UNWATCHED].call(signal);
-        }
-        if (this.signals.size === 0) WATCHERS.delete(this);
-      }
-
-      // Returns the set of sources in the Watcher's set which are still dirty, or is a computed signal
-      // with a source which is dirty or pending and hasn't yet been re-evaluated
-      getPending(): Signal[] {
-        return Array.from(this.signals);
-      }
-    }
-
-    // Hooks to observe being watched or no longer watched
-    const watched = $WATCHED;
-    const unwatched = $UNWATCHED;
-  }
-
-  interface SignalOptions<T> {
-    // Custom comparison function between old and new value. Default: Object.is.
-    // The signal is passed in as the this value for context.
-    equals?: (this: Signal<T>, t: T, t2: T) => boolean;
-
-    // Callback called when isWatched becomes true, if it was previously false
-    [Signal.subtle.watched]?: (this: Signal<T>) => void;
-
-    // Callback called whenever isWatched becomes false, if it was previously true
-    [Signal.subtle.unwatched]?: (this: Signal<T>) => void;
+    return this.lastValue;
   }
 }
+
+// This namespace includes "advanced" features that are better to
+// leave for framework authors rather than application developers.
+// Analogous to `crypto.subtle`
+function untrack<T>(cb: () => T): T {
+  consumptionEnabled = false;
+  try {
+    return cb();
+  } finally {
+    consumptionEnabled = true;
+  }
+}
+
+// Get the current computed signal which is tracking any signal reads, if any
+function currentComputed(): Computed<unknown> | undefined {
+  return currentComputedRef ?? undefined;
+}
+
+// Returns ordered list of all signals which this one referenced
+// during the last time it was evaluated.
+// For a Watcher, lists the set of signals which it is watching.
+function introspectSources(sink: Computed<unknown> | Watcher): Trackable[] {
+  if (sink instanceof Computed) return sink.lastTracked;
+  if (sink instanceof Watcher) return Array.from(sink.watched);
+  return [];
+}
+
+// Returns the Watchers that this signal is contained in, plus any
+// Computed signals which read this signal last time they were evaluated,
+// if that computed signal is (recursively) watched.
+function introspectSinks(
+  source: State<unknown> | Computed<unknown>
+): (Computed<unknown> | Watcher)[] {
+  return Array.from(new Set([
+    ...Array.from(watchers).filter((watcher) => watcher.watched.has(source)),
+    ...source[$COMPUTED_REFS],
+  ]));
+}
+
+// True if this signal is "live", in that it is watched by a Watcher,
+// or it is read by a Computed signal which is (recursively) live.
+function hasSinks(source: State<unknown> | Computed<unknown>): boolean {
+  if (source[$COMPUTED_REFS].size > 0) return true;
+  for (let watcher of watchers) if (watcher.watched.has(source)) return true;
+  return false;
+}
+
+// True if this element is "reactive", in that it depends
+// on some other signal. A Computed where hasSources is false
+// will always return the same constant.
+function hasSources(sink: Computed<unknown> | Watcher): boolean {
+  if (sink instanceof Computed) return sink.lastTracked.length > 0;
+  if (sink instanceof Watcher) return sink.watched.size > 0;
+  return false;
+}
+
+class Watcher {
+  watched = new Set<Watchable>();
+  [$WATCHER_NOTIFY]: (this: Watcher) => void;
+
+  // When a (recursive) source of Watcher is written to, call this callback,
+  // if it hasn't already been called since the last `watch` call.
+  // No signals may be read or written during the notify.
+  constructor(notify: (this: Watcher) => void) {
+    this[$WATCHER_NOTIFY] = notify;
+  }
+
+  // Add these signals to the Watcher's set, and set the watcher to run its
+  // notify callback next time any signal in the set (or one of its dependencies) changes.
+  // Can be called with no arguments just to reset the "notified" state, so that
+  // the notify callback will be invoked again.
+  watch(...watchables: Watchable[]): void {
+    for (let watchable of watchables) {
+      this.watched.add(watchable);
+      watchable[$WATCHED]();
+    }
+    if (this.watched.size > 0) watchers.add(this);
+  }
+
+  // Remove these signals from the watched set (e.g., for an effect which is disposed)
+  unwatch(...watchables: Watchable[]): void {
+    for (let watchable of watchables) {
+      this.watched.delete(watchable);
+      watchable[$UNWATCHED]();
+    }
+    if (this.watched.size === 0) watchers.delete(this);
+  }
+
+  // Returns the set of sources in the Watcher's set which are still dirty, or is a computed signal
+  // with a source which is dirty or pending and hasn't yet been re-evaluated
+  getPending(): Trackable[] {
+    return Array.from(this.watched).filter(isTrackedDirty);
+  }
+}
+
+export const Signal = {
+  State,
+  Computed,
+  subtle: {
+    Watcher,
+    currentComputed,
+    introspectSinks,
+    introspectSources,
+    hasSources,
+    hasSinks,
+    untrack,
+    watched: $WATCHED,
+    unwatched: $UNWATCHED,
+  },
+};
